@@ -1,0 +1,679 @@
+# ------------------------------------------------------------------------
+# Modified Based on Mask DINO
+from typing import Tuple
+
+import torch
+from torch import nn
+import skimage
+from torch.nn import functional as F
+
+from detectron2.config import configurable
+from detectron2.data import MetadataCatalog
+from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_seg_head
+from detectron2.modeling.backbone import Backbone
+from detectron2.modeling.postprocessing import sem_seg_postprocess
+from detectron2.structures import Boxes, ImageList, Instances, BitMasks
+from detectron2.utils.memory import retry_if_cuda_oom
+
+from .modeling.criterion import SetCriterion
+from .modeling.matcher import HungarianMatcher
+from .utils import box_ops
+import time
+import random
+import os
+import numpy as np
+from osgeo import gdal
+from .utils.SSIM import ssim_similarity_matrix, SR
+
+
+def write_img(img: np.ndarray, save_path: str):
+    """
+    Save ndarray as imagery
+    :param img:
+    :param save_path:
+    :param gdal_write: 
+    :return:
+    """
+    if 'int8' in img.dtype.name:
+        datatype = gdal.GDT_Byte
+    elif 'int16' in img.dtype.name:
+        datatype = gdal.GDT_UInt16
+    else:
+        datatype = gdal.GDT_Float32
+
+    if len(img.shape) == 3:
+        img = np.transpose(img, axes=(2, 0, 1))  # [h,w,c]->[c,h,w]
+    elif len(img.shape) == 2:
+        img = np.expand_dims(img, axis=0)
+
+    img_bands, img_height, img_width = img.shape
+
+    driver = gdal.GetDriverByName("GTiff")
+    dataset = driver.Create(save_path, int(img_width), int(img_height), int(img_bands), datatype)
+    for i in range(img_bands):
+        dataset.GetRasterBand(i + 1).WriteArray(img[i])
+    del dataset
+
+def svd_flip(u, v):
+    # columns of u, rows of v
+    max_abs_cols = torch.argmax(torch.abs(u), 0)
+    i = torch.arange(u.shape[1]).to(u.device)
+    signs = torch.sign(u[max_abs_cols, i])
+    u *= signs
+    v *= signs.view(-1, 1)
+    return u, v
+
+class PCA(nn.Module):
+    def __init__(self, n_components):
+        super().__init__()
+        self.n_components = n_components
+
+    @torch.no_grad()
+    def fit(self, X):
+        n, d = X.size()
+        if self.n_components is not None:
+            d = min(self.n_components, d)
+        self.register_buffer("mean_", X.mean(0, keepdim=True))
+        Z = X - self.mean_ # center
+        U, S, Vh = torch.linalg.svd(Z, full_matrices=False)
+        Vt = Vh
+        U, Vt = svd_flip(U, Vt)
+        self.register_buffer("components_", Vt[:d])
+        return self
+
+    def forward(self, X):
+        return self.transform(X)
+
+    def transform(self, X):
+        assert hasattr(self, "components_"), "PCA must be fit before use."
+        return torch.matmul(X - self.mean_, self.components_.t())
+
+    def fit_transform(self, X):
+        self.fit(X)
+        return self.transform(X)
+
+    def inverse_transform(self, Y):
+        assert hasattr(self, "components_"), "PCA must be fit before use."
+        return torch.matmul(Y, self.components_) + self.mean_
+    
+
+@META_ARCH_REGISTRY.register()
+class MaskDINO(nn.Module):
+    """
+    Main class for mask classification semantic segmentation architectures.
+    """
+
+    @configurable
+    def __init__(
+        self,
+        *,
+        backbone: Backbone,
+        sem_seg_head: nn.Module,
+        criterion: nn.Module,
+        num_queries: int,
+        object_mask_threshold: float,
+        overlap_threshold: float,
+        metadata,
+        size_divisibility: int,
+        sem_seg_postprocess_before_inference: bool,
+        pixel_mean: Tuple[float],
+        pixel_std: Tuple[float],
+        # inference
+        semantic_on: bool,
+        panoptic_on: bool,
+        instance_on: bool,
+        test_topk_per_image: int,
+        data_loader: str,
+        pano_temp: float,
+        focus_on_box: bool = False,
+        transform_eval: bool = False,
+        semantic_ce_loss: bool = False,
+    ):
+        """
+        Args:
+            backbone: a backbone module, must follow detectron2's backbone interface
+            sem_seg_head: a module that predicts semantic segmentation from backbone features
+            criterion: a module that defines the loss
+            num_queries: int, number of queries
+            object_mask_threshold: float, threshold to filter query based on classification score
+                for panoptic segmentation inference
+            overlap_threshold: overlap threshold used in general inference for panoptic segmentation
+            metadata: dataset meta, get `thing` and `stuff` category names for panoptic
+                segmentation inference
+            size_divisibility: Some backbones require the input height and width to be divisible by a
+                specific integer. We can use this to override such requirement.
+            sem_seg_postprocess_before_inference: whether to resize the prediction back
+                to original input size before semantic segmentation inference or after.
+                For high-resolution dataset like Mapillary, resizing predictions before
+                inference will cause OOM error.
+            pixel_mean, pixel_std: list or tuple with #channels element, representing
+                the per-channel mean and std to be used to normalize the input image
+            semantic_on: bool, whether to output semantic segmentation prediction
+            instance_on: bool, whether to output instance segmentation prediction
+            panoptic_on: bool, whether to output panoptic segmentation prediction
+            test_topk_per_image: int, instance segmentation parameter, keep topk instances per image
+            transform_eval: transform sigmoid score into softmax score to make score sharper
+            semantic_ce_loss: whether use cross-entroy loss in classification
+        """
+        super().__init__()
+        self.backbone = backbone
+        self.pano_temp = pano_temp
+        self.sem_seg_head = sem_seg_head
+        self.criterion = criterion
+        self.num_queries = num_queries
+        self.overlap_threshold = overlap_threshold
+        self.object_mask_threshold = object_mask_threshold
+        self.metadata = metadata
+        if size_divisibility < 0:
+            # use backbone size_divisibility if not set
+            size_divisibility = self.backbone.size_divisibility
+        self.size_divisibility = size_divisibility
+        self.sem_seg_postprocess_before_inference = sem_seg_postprocess_before_inference
+        self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
+        self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
+
+        # additional args
+        self.semantic_on = semantic_on
+        self.instance_on = instance_on
+        self.panoptic_on = panoptic_on
+        self.test_topk_per_image = test_topk_per_image
+
+        self.data_loader = data_loader
+        self.focus_on_box = focus_on_box
+        self.transform_eval = transform_eval
+        self.semantic_ce_loss = semantic_ce_loss
+        self.pca = PCA(n_components=3)
+
+        if not self.semantic_on:
+            assert self.sem_seg_postprocess_before_inference
+
+        print('criterion.weight_dict ', self.criterion.weight_dict)
+
+    @classmethod
+    def from_config(cls, cfg):
+        backbone = build_backbone(cfg)
+        sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
+
+        # Loss parameters:
+        deep_supervision = cfg.MODEL.MaskDINO.DEEP_SUPERVISION
+        no_object_weight = cfg.MODEL.MaskDINO.NO_OBJECT_WEIGHT
+
+        # loss weights
+        class_weight = cfg.MODEL.MaskDINO.CLASS_WEIGHT
+        cost_class_weight = cfg.MODEL.MaskDINO.COST_CLASS_WEIGHT
+        cost_dice_weight = cfg.MODEL.MaskDINO.COST_DICE_WEIGHT
+        dice_weight = cfg.MODEL.MaskDINO.DICE_WEIGHT  #
+        cost_mask_weight = cfg.MODEL.MaskDINO.COST_MASK_WEIGHT  #
+        mask_weight = cfg.MODEL.MaskDINO.MASK_WEIGHT
+        cost_box_weight = cfg.MODEL.MaskDINO.COST_BOX_WEIGHT
+        box_weight = cfg.MODEL.MaskDINO.BOX_WEIGHT  #
+        cost_giou_weight = cfg.MODEL.MaskDINO.COST_GIOU_WEIGHT
+        giou_weight = cfg.MODEL.MaskDINO.GIOU_WEIGHT  #
+        # building matcher
+        matcher = HungarianMatcher(
+            cost_class=cost_class_weight,
+            cost_mask=cost_mask_weight,
+            cost_dice=cost_dice_weight,
+            cost_box=cost_box_weight,
+            cost_giou=cost_giou_weight,
+            num_points=cfg.MODEL.MaskDINO.TRAIN_NUM_POINTS,
+        )
+
+        weight_dict = {"loss_ce": class_weight}
+        weight_dict.update({"loss_mask": mask_weight, "loss_dice": dice_weight})
+        weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
+        # two stage is the query selection scheme
+        if cfg.MODEL.MaskDINO.TWO_STAGE:
+            interm_weight_dict = {}
+            interm_weight_dict.update({k + f'_interm': v for k, v in weight_dict.items()})
+            weight_dict.update(interm_weight_dict)
+        # denoising training
+        dn = cfg.MODEL.MaskDINO.DN
+        if dn == "standard":
+            weight_dict.update({k + f"_dn": v for k, v in weight_dict.items() if k!="loss_mask" and k!="loss_dice" })
+            dn_losses=["labels","boxes"]
+        elif dn == "seg":
+            weight_dict.update({k + f"_dn": v for k, v in weight_dict.items()})
+            dn_losses=["labels", "masks","boxes"]
+        else:
+            dn_losses=[]
+        if deep_supervision:
+            dec_layers = cfg.MODEL.MaskDINO.DEC_LAYERS
+            aux_weight_dict = {}
+            for i in range(dec_layers):
+                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
+            weight_dict.update(aux_weight_dict)
+        if cfg.MODEL.MaskDINO.BOX_LOSS:
+            losses = ["labels", "masks","boxes"]
+        else:
+            losses = ["labels", "masks"]
+        # building criterion
+        criterion = SetCriterion(
+            sem_seg_head.num_classes,
+            matcher=matcher,
+            weight_dict=weight_dict,
+            eos_coef=no_object_weight,
+            losses=losses,
+            num_points=cfg.MODEL.MaskDINO.TRAIN_NUM_POINTS,
+            oversample_ratio=cfg.MODEL.MaskDINO.OVERSAMPLE_RATIO,
+            importance_sample_ratio=cfg.MODEL.MaskDINO.IMPORTANCE_SAMPLE_RATIO,
+            dn=cfg.MODEL.MaskDINO.DN,
+            dn_losses=dn_losses,
+            panoptic_on=cfg.MODEL.MaskDINO.PANO_BOX_LOSS,
+            semantic_ce_loss=cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
+        )
+
+        return {
+            "backbone": backbone,
+            "sem_seg_head": sem_seg_head,
+            "criterion": criterion,
+            "num_queries": cfg.MODEL.MaskDINO.NUM_OBJECT_QUERIES,
+            "object_mask_threshold": cfg.MODEL.MaskDINO.TEST.OBJECT_MASK_THRESHOLD,
+            "overlap_threshold": cfg.MODEL.MaskDINO.TEST.OVERLAP_THRESHOLD,
+            "metadata": MetadataCatalog.get(cfg.DATASETS.TRAIN[0]),
+            "size_divisibility": cfg.MODEL.MaskDINO.SIZE_DIVISIBILITY,
+            "sem_seg_postprocess_before_inference": (
+                cfg.MODEL.MaskDINO.TEST.SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE
+                or cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
+                or cfg.MODEL.MaskDINO.TEST.INSTANCE_ON
+            ),
+            "pixel_mean": cfg.MODEL.PIXEL_MEAN,
+            "pixel_std": cfg.MODEL.PIXEL_STD,
+            # inference
+            "semantic_on": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON,
+            "instance_on": cfg.MODEL.MaskDINO.TEST.INSTANCE_ON,
+            "panoptic_on": cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
+            "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
+            "data_loader": cfg.INPUT.DATASET_MAPPER_NAME,
+            "focus_on_box": cfg.MODEL.MaskDINO.TEST.TEST_FOUCUS_ON_BOX,
+            "transform_eval": cfg.MODEL.MaskDINO.TEST.PANO_TRANSFORM_EVAL,
+            "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
+            "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
+        }
+
+    @property
+    def device(self):
+        return self.pixel_mean.device
+    
+    def get_binary_mask(self, batched_inputs):
+        sample_len = len(batched_inputs)
+        masks = []
+        for i in range(sample_len):
+            mask = batched_inputs[i]['instances'].gt_masks
+
+            try:
+                mask2 = torch.max(mask, dim=0)[0]
+            except:
+                mask2 = torch.zeros((mask.shape[1], mask.shape[2])).to(mask.device)
+            mask2 = mask2.unsqueeze(0).unsqueeze(1)
+            masks.append(mask2)
+        mask2 = torch.cat(masks, dim=0)
+        return mask2
+    
+    def varying_channel_processing(self, o_img, ori_shape):
+        o_img = o_img.unsqueeze(0)
+        device = o_img.device
+        input_size = o_img.shape
+        normal_img = torch.nn.functional.interpolate(o_img.detach(), (int(ori_shape[0]/4), int(ori_shape[1]/4)), mode='nearest')
+        # o_img = torch.nn.functional.interpolate(o_img, (224,224), mode='nearest')
+        o_img = o_img.squeeze(0)
+
+        n_spectral1 = normal_img[:,:,random.choice(np.arange(int(ori_shape[0]/4))), random.choice(np.arange(int(ori_shape[0]/4)))].unsqueeze(2).unsqueeze(3)
+        n_spectral2 = normal_img[:,:,random.choice(np.arange(int(ori_shape[0]/4))), random.choice(np.arange(int(ori_shape[0]/4)))].unsqueeze(2).unsqueeze(3)
+        n_spectral3 = normal_img[:,:,random.choice(np.arange(int(ori_shape[0]/4))), random.choice(np.arange(int(ori_shape[0]/4)))].unsqueeze(2).unsqueeze(3)
+        # n_spectral4 = normal_img[:,:,random.choice(np.arange(int(ori_shape[0]/4))), random.choice(np.arange(int(ori_shape[0]/4)))].unsqueeze(2).unsqueeze(3)
+        # n_spectral5 = normal_img[:,:,random.choice(np.arange(int(ori_shape[0]/4))), random.choice(np.arange(int(ori_shape[0]/4)))].unsqueeze(2).unsqueeze(3)
+
+
+        n_spectral1 = n_spectral1.repeat((1,1,o_img.shape[1],o_img.shape[2]))
+        n_spectral2 = n_spectral2.repeat((1,1,o_img.shape[1],o_img.shape[2]))
+        n_spectral3 = n_spectral3.repeat((1,1,o_img.shape[1],o_img.shape[2]))
+        # n_spectral4 = n_spectral4.repeat((1,1,o_img.shape[1],o_img.shape[2]))
+        # n_spectral5 = n_spectral5.repeat((1,1,o_img.shape[1],o_img.shape[2]))
+
+        o_img = o_img.unsqueeze(0)
+        s_img1 = self.get_multi_distance(o_img, n_spectral1)
+        s_img2 = self.get_multi_distance(o_img, n_spectral2)
+        s_img3 = self.get_multi_distance(o_img, n_spectral3)
+        # s_img4 = self.get_multi_distance(o_img, n_spectral4)
+        # s_img5 = self.get_multi_distance(o_img, n_spectral5)
+        
+        band1 = torch.min(torch.cat([s_img1[:,0,:,:], s_img2[:,0,:,:], s_img3[:,0,:,:],], dim=0), dim=0)[0].unsqueeze(0).unsqueeze(1)
+        band2 = torch.min(torch.cat([s_img1[:,1,:,:], s_img2[:,1,:,:], s_img3[:,1,:,:],], dim=0), dim=0)[0].unsqueeze(0).unsqueeze(1)
+        band3 = torch.min(torch.cat([s_img1[:,2,:,:], s_img2[:,2,:,:], s_img3[:,2,:,:],], dim=0), dim=0)[0].unsqueeze(0).unsqueeze(1)
+
+        s_img = torch.cat([band1, band2, band3], dim=1)
+
+        return s_img.squeeze(0)
+    
+    def get_multi_distance(self, o_img, normal_img):
+        cosine_distance = torch.cosine_similarity(o_img, normal_img, dim=1, eps=1e-08).unsqueeze(1)
+        l1_distance = torch.norm(o_img - normal_img, dim=1, p=1).unsqueeze(1)
+        l1_distance = (l1_distance - l1_distance.min())/(l1_distance.max() - l1_distance.min())
+        l2_distance = torch.norm(o_img - normal_img, dim=1, p=2).unsqueeze(1)
+        l2_distance = (l2_distance - l2_distance.min())/(l2_distance.max() - l2_distance.min())
+        s_img = torch.cat([cosine_distance, l2_distance, l1_distance], dim=1)
+        return s_img
+    
+    def get_270_channels(self, img):
+        ratio = int(270/img.shape[0])
+        if ratio == 0:
+            ratio = 1
+        img = img.repeat((ratio,1,1))
+        if img.shape[0] < 270:
+            img = torch.cat([img, img[0:(270 -img.shape[0]),:,:]], 0)
+        elif img.shape[0] > 270:
+            img = img[0:270,:,:]
+        # if img.shape[0] != 270:
+        #     print(1)
+        return img
+    
+    def forward(self, batched_inputs):
+        """
+        Args:
+            batched_inputs: a list, batched outputs of :class:`DatasetMapper`.
+                Each item in the list contains the inputs for one image.
+                For now, each item in the list is a dict that contains:
+                   * "image": Tensor, image in (C, H, W) format.
+                   * "instances": per-region ground truth
+                   * Other information that's included in the original dicts, such as:
+                     "height", "width" (int): the output resolution of the model (may be different
+                     from input resolution), used in inference.
+        Returns:
+            list[dict]:
+                each dict has the results for one image. The dict contains the following keys:
+
+                * "sem_seg":
+                    A Tensor that represents the
+                    per-pixel segmentation prediced by the head.
+                    The prediction has shape KxHxW that represents the logits of
+                    each class for each pixel.
+                * "panoptic_seg":
+                    A tuple that represent panoptic output
+                    panoptic_seg (Tensor): of shape (height, width) where the values are ids for each segment.
+                    segments_info (list[dict]): Describe each segment in `panoptic_seg`.
+                        Each dict contains keys "id", "category_id", "isthing".
+        """
+        images = [x["image"].to(self.device) for x in batched_inputs]
+
+        #---------------------------------------------------------------------------------------------
+        # Preprocessing for Varying Remote Sensing Channel
+        for i in range(1):
+            image = images[i]
+            if image.shape[0] > 3:
+                image_1 = self.varying_channel_processing(image, (images[0].shape[1], images[0].shape[2]))
+                image = image_1
+            else:
+                self.new_mean = torch.tensor([123.675, 116.28, 103.53], device=image.device).unsqueeze(1).unsqueeze(2).repeat(1,image.shape[1],image.shape[2])
+                self.new_std = torch.tensor([58.395, 57.12, 57.375], device=image.device).unsqueeze(1).unsqueeze(2).repeat(1,image.shape[1],image.shape[2])
+                image = (image - self.new_mean)/self.new_std
+        #---------------------------------------------------------------------------------------------
+
+        images = [image]
+        images = ImageList.from_tensors(images, self.size_divisibility)
+        features = self.backbone(images.tensor)
+
+        if self.training:
+            # dn_args={"scalar":30,"noise_scale":0.4}
+            # mask classification target
+            self.test_dir_id = str(time.time())
+            if "instances" in batched_inputs[0]:
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                if 'detr' in self.data_loader:
+                    targets = self.prepare_targets_detr(gt_instances, images)
+                else:
+                    targets = self.prepare_targets(gt_instances, images)
+            else:
+                targets = None
+
+            #---------------------------------------------------------------------------------
+            mask = self.get_binary_mask(batched_inputs)
+            outputs,mask_dict = self.sem_seg_head(features, mask=mask, targets=targets)
+            #---------------------------------------------------------------------------------
+            
+            # bipartite matching-based loss
+            losses = self.criterion(outputs, targets,mask_dict)
+
+            for k in list(losses.keys()):
+                if k in self.criterion.weight_dict:
+                    losses[k] *= self.criterion.weight_dict[k]
+                else:
+                    # remove this loss if not specified in `weight_dict`
+                    losses.pop(k)
+            #---------------------------------------------------------------
+            losses['anomaly_loss'] = outputs['anomaly_loss']
+            #---------------------------------------------------------------
+            return losses
+        
+        else:
+            outputs, _ = self.sem_seg_head(features)
+            mask_cls_results = outputs["pred_logits"]
+            mask_pred_results = outputs["pred_masks"]
+            mask_box_results = outputs["pred_boxes"]
+            # upsample masks
+            mask_pred_results = F.interpolate(
+                mask_pred_results,
+                size=(images.tensor.shape[-2], images.tensor.shape[-1]),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            # Output pixel-level anomaly maps
+            # out_dir = os.path.join('/media/data2/ljt/results_saved_1001/anomaly_map_comp/HSI/') + self.test_dir_id
+            # if not os.path.exists(out_dir):
+            #     os.makedirs(out_dir)
+
+            # output_pth = os.path.join(out_dir, os.path.split(batched_inputs[0]['file_name'])[1])
+            # write_img(outputs['anomaly_maps'][0,0,:,:].detach().cpu().numpy(), output_pth)
+            # del outputs
+
+            processed_results = []
+            for mask_cls_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
+            ):  
+                # image_size is augmented size, not divisible to 32
+                height = input_per_image.get("height", image_size[0])  # real size
+                width = input_per_image.get("width", image_size[1])
+                processed_results.append({})
+                new_size = mask_pred_result.shape[-2:]  # padded size (divisible to 32)
+
+
+                if self.sem_seg_postprocess_before_inference:
+                    mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                        mask_pred_result, image_size, height, width
+                    )
+                    mask_cls_result = mask_cls_result.to(mask_pred_result)
+                    # mask_box_result = mask_box_result.to(mask_pred_result)
+                    # mask_box_result = self.box_postprocess(mask_box_result, height, width)
+
+                # semantic segmentation inference
+                if self.semantic_on:
+                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result)
+                    if not self.sem_seg_postprocess_before_inference:
+                        r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
+                    processed_results[-1]["sem_seg"] = r
+
+                # panoptic segmentation inference
+                if self.panoptic_on:
+                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
+                    processed_results[-1]["panoptic_seg"] = panoptic_r
+
+                # instance segmentation inference
+
+                if self.instance_on:
+                    mask_box_result = mask_box_result.to(mask_pred_result)
+                    height = new_size[0]/image_size[0]*height
+                    width = new_size[1]/image_size[1]*width
+                    mask_box_result = self.box_postprocess(mask_box_result, height, width)
+
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
+                    processed_results[-1]["instances"] = instance_r
+
+            return processed_results
+
+    def prepare_targets(self, targets, images):
+        h_pad, w_pad = images.tensor.shape[-2:]
+        new_targets = []
+        for targets_per_image in targets:
+            # pad gt
+            h, w = targets_per_image.image_size
+            image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
+
+            gt_masks = targets_per_image.gt_masks
+            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            new_targets.append(
+                {
+                    "labels": targets_per_image.gt_classes,
+                    "masks": padded_masks,
+                    "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
+                }
+            )
+        return new_targets
+
+    def prepare_targets_detr(self, targets, images):
+        h_pad, w_pad = images.tensor.shape[-2:]
+        new_targets = []
+        for targets_per_image in targets:
+            # pad gt
+            h, w = targets_per_image.image_size
+            image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
+
+            gt_masks = targets_per_image.gt_masks
+            padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+            padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            new_targets.append(
+                {
+                    "labels": targets_per_image.gt_classes,
+                    "masks": padded_masks,
+                    "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy
+                }
+            )
+        return new_targets
+
+    def semantic_inference(self, mask_cls, mask_pred):
+        # if use cross-entropy loss in training, evaluate with softmax
+        if self.semantic_ce_loss:
+            mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]
+            mask_pred = mask_pred.sigmoid()
+            semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
+            return semseg
+        # if use focal loss in training, evaluate with sigmoid. As sigmoid is mainly for detection and not sharp
+        # enough for semantic and panoptic segmentation, we additionally use use softmax with a temperature to
+        # make the score sharper.
+        else:
+            T = self.pano_temp
+            mask_cls = mask_cls.sigmoid()
+            if self.transform_eval:
+                mask_cls = F.softmax(mask_cls / T, dim=-1)  # already sigmoid
+            mask_pred = mask_pred.sigmoid()
+            semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
+            return semseg
+
+    def panoptic_inference(self, mask_cls, mask_pred):
+        # As we use focal loss in training, evaluate with sigmoid. As sigmoid is mainly for detection and not sharp
+        # enough for semantic and panoptic segmentation, we additionally use use softmax with a temperature to
+        # make the score sharper.
+        prob = 0.5
+        T = self.pano_temp
+        scores, labels = mask_cls.sigmoid().max(-1)
+        mask_pred = mask_pred.sigmoid()
+        keep = labels.ne(self.sem_seg_head.num_classes) & (scores > self.object_mask_threshold)
+        # added process
+        if self.transform_eval:
+            scores, labels = F.softmax(mask_cls.sigmoid() / T, dim=-1).max(-1)
+        cur_scores = scores[keep]
+        cur_classes = labels[keep]
+        cur_masks = mask_pred[keep]
+        cur_prob_masks = cur_scores.view(-1, 1, 1) * cur_masks
+
+        h, w = cur_masks.shape[-2:]
+        panoptic_seg = torch.zeros((h, w), dtype=torch.int32, device=cur_masks.device)
+        segments_info = []
+
+        current_segment_id = 0
+
+        if cur_masks.shape[0] == 0:
+            # We didn't detect any mask :(
+            return panoptic_seg, segments_info
+        else:
+            # take argmax
+            cur_mask_ids = cur_prob_masks.argmax(0)
+            stuff_memory_list = {}
+            for k in range(cur_classes.shape[0]):
+                pred_class = cur_classes[k].item()
+                isthing = pred_class in self.metadata.thing_dataset_id_to_contiguous_id.values()
+                mask_area = (cur_mask_ids == k).sum().item()
+                original_area = (cur_masks[k] >= prob).sum().item()
+                mask = (cur_mask_ids == k) & (cur_masks[k] >= prob)
+
+                if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
+                    if mask_area / original_area < self.overlap_threshold:
+                        continue
+
+                    # merge stuff regions
+                    if not isthing:
+                        if int(pred_class) in stuff_memory_list.keys():
+                            panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
+                            continue
+                        else:
+                            stuff_memory_list[int(pred_class)] = current_segment_id + 1
+
+                    current_segment_id += 1
+                    panoptic_seg[mask] = current_segment_id
+
+                    segments_info.append(
+                        {
+                            "id": current_segment_id,
+                            "isthing": bool(isthing),
+                            "category_id": int(pred_class),
+                        }
+                    )
+
+            return panoptic_seg, segments_info
+
+    def instance_inference(self, mask_cls, mask_pred, mask_box_result):
+        # mask_pred is already processed to have the same shape as original input
+        image_size = mask_pred.shape[-2:]
+        scores = mask_cls.sigmoid()  # [100, 80]
+        labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
+        scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)  # select 100
+        labels_per_image = labels[topk_indices]
+        topk_indices = topk_indices // self.sem_seg_head.num_classes
+        mask_pred = mask_pred[topk_indices]
+        # if this is panoptic segmentation, we only keep the "thing" classes
+        if self.panoptic_on:
+            keep = torch.zeros_like(scores_per_image).bool()
+            for i, lab in enumerate(labels_per_image):
+                keep[i] = lab in self.metadata.thing_dataset_id_to_contiguous_id.values()
+            scores_per_image = scores_per_image[keep]
+            labels_per_image = labels_per_image[keep]
+            mask_pred = mask_pred[keep]
+        result = Instances(image_size)
+        # mask (before sigmoid)
+        result.pred_masks = (mask_pred > 0).float()
+        # half mask box half pred box
+        mask_box_result = mask_box_result[topk_indices]
+        if self.panoptic_on:
+            mask_box_result = mask_box_result[keep]
+        result.pred_boxes = Boxes(mask_box_result)
+        # Uncomment the following to get boxes from masks (this is slow)
+        # result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+
+        # calculate average mask prob
+        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
+        if self.focus_on_box:
+            mask_scores_per_image = 1.0
+        result.scores = scores_per_image * mask_scores_per_image
+        result.pred_classes = labels_per_image
+        return result
+
+    def box_postprocess(self, out_bbox, img_h, img_w):
+        # postprocess box height and width
+        boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+        scale_fct = torch.tensor([img_w, img_h, img_w, img_h])
+        scale_fct = scale_fct.to(out_bbox)
+        boxes = boxes * scale_fct
+        return boxes
+
+
