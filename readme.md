@@ -33,7 +33,7 @@ This is a PyTorch implementation of the [Instance Adaptation for RSAD](https://i
 ### Preparation
 
 1. Install required packages according to the requirements.txt.
-2. Download the simulated training dataset (using simulation workflow from [UniADRS](https://github.com/Jingtao-Li-CVer/UniADRS)) and testing dataset from [here](). Update the dataset path in file `train_net.py (line 16-19)` and `tools/visualize_json_results.py (line 14-17)`.
+2. Download the simulated training dataset (using simulation workflow from [UniADRS](https://github.com/Jingtao-Li-CVer/UniADRS)) and testing dataset from [here](https://www.wjx.cn/vm/OlbYUhY.aspx#). Update the dataset path in file `train_net.py (line 16-19)` and `tools/visualize_json_results.py (line 14-17)`.
 3. Download the pre-trained [maskdino](https://github.com/IDEA-Research/detrex-storage/releases/download/maskdino-v0.1.0/maskdino_r50_50ep_300q_hid1024_3sd1_instance_maskenhanced_mask46.1ap_box51.5ap.pth) checkpoint and replace the 'WEIGHTS' key in config.yaml.
 
 ### Model Training and Testing
