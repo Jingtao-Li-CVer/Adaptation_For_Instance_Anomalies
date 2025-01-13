@@ -95,7 +95,7 @@ if __name__ == "__main__":
     parser.add_argument("--input", help="JSON file produced by the model")
     parser.add_argument("--output",  help="output directory")
     parser.add_argument("--dataset", help="name of the dataset", default="adrs_test_thermal")
-    parser.add_argument("--conf-threshold", default=0.25, type=float, help="confidence threshold")
+    parser.add_argument("--conf-threshold", default=0.35, type=float, help="confidence threshold")
     args = parser.parse_args()
 
     logger = setup_logger()
